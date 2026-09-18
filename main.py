@@ -1,45 +1,62 @@
 # Mini Blog v2 - FastAPI
-# Validaciones avanzadas y modelos en FastAPI
-# + Guía 2: Path Parameters y Query Parameters
+# Validaciones avanzadas y modelos (Guía 1)
+# + Path/Query Parameters (Guía 2)
+# + Bases de datos relacionales con SQLAlchemy (Guía 3)
 
-from fastapi import FastAPI, Query, Path, HTTPException
+from fastapi import FastAPI, Query, Path, HTTPException, Depends
 from pydantic import BaseModel, Field, field_validator, model_validator
+from sqlalchemy.orm import Session
 from typing import Optional, List, Literal
 
+import Models as models
+from Database import engine, SessionLocal
 
-app = FastAPI(title="Mini Blog v2", version="1.0.0")
+
+# =========================================================
+# Base de datos
+# =========================================================
+
+models.Base.metadata.create_all(bind=engine)
+
+
+# =========================================================
+# Aplicación FastAPI
+# =========================================================
+
+app = FastAPI(
+    title="Mini Blog v2",
+    version="1.0.0"
+)
 
 TAG_POSTS = ["Posts"]
 TAG_SISTEMA = ["Sistema"]
 
 
-BLOG_POST: List[dict] = [
-    {
-        "id": 1,
-        "titulo": "Hola desde FastAPI",
-        "contenido": "Mi primer post con FastAPI",
-        "autor": {"nombre": "Edison Suarez", "email": "edison@example.com"},
-        "estado": "borrador",
-        "comentarios": [],
-    },
-    {
-        "id": 2,
-        "titulo": "Segundo post",
-        "contenido": "Mi segundo post con FastAPI",
-        "autor": {"nombre": "Edison Suarez", "email": "edison@example.com"},
-        "estado": "borrador",
-        "comentarios": [],
-    },
-    {
-        "id": 3,
-        "titulo": "Django vs FastAPI",
-        "contenido": "FastAPI es más rápido por xxxxx",
-        "autor": {"nombre": "Edison Suarez", "email": "edison@example.com"},
-        "estado": "borrador",
-        "comentarios": [],
-    },
-]
+# =========================================================
+# Dependencia de base de datos
+# =========================================================
 
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# =========================================================
+# Comentarios
+# =========================================================
+
+# Los comentarios se mantienen en memoria.
+# Los posts sí se guardan en la base de datos.
+
+COMENTARIOS_POR_POST: dict[int, list[dict]] = {}
+
+
+# =========================================================
+# Modelos Pydantic
+# =========================================================
 
 class Autor(BaseModel):
     nombre: str
@@ -65,22 +82,35 @@ class ComentarioCreate(BaseModel):
 
 
 class PostCreate(BaseModel):
-    titulo: str = Field(..., min_length=1, description="Título del post")
+    titulo: str = Field(
+        ...,
+        min_length=1,
+        description="Título del post"
+    )
+
     contenido: str
+
     autor: Autor
 
     @field_validator("titulo")
     @classmethod
     def title_sin_espacios_extra(cls, value: str) -> str:
         limpio = value.strip()
+
         if not limpio:
-            raise ValueError("El título no puede estar vacío ni contener solo espacios")
+            raise ValueError(
+                "El título no puede estar vacío ni contener solo espacios"
+            )
+
         return limpio
 
     @model_validator(mode="after")
     def titulo_distinto_de_contenido(self):
         if self.titulo.strip().lower() == self.contenido.strip().lower():
-            raise ValueError("El título no puede ser igual al contenido")
+            raise ValueError(
+                "El título no puede ser igual al contenido"
+            )
+
         return self
 
 
@@ -90,12 +120,21 @@ class PostUpdate(BaseModel):
 
     @field_validator("titulo")
     @classmethod
-    def title_sin_espacios_extra(cls, value: Optional[str]) -> Optional[str]:
+    def title_sin_espacios_extra(
+        cls,
+        value: Optional[str]
+    ) -> Optional[str]:
+
         if value is None:
             return value
+
         limpio = value.strip()
+
         if not limpio:
-            raise ValueError("El título no puede estar vacío ni contener solo espacios")
+            raise ValueError(
+                "El título no puede estar vacío ni contener solo espacios"
+            )
+
         return limpio
 
 
@@ -112,81 +151,374 @@ class PostPublicoOut(BaseModel):
     comentarios: List[Comentario] = []
 
 
-@app.get("/", tags=TAG_SISTEMA, summary="Mensaje de bienvenida")
-def home():
-    return {"mensaje": "Bienvenidos a mi blog Edison Suares"}
+# =========================================================
+# Modelo de respuesta para GET /posts
+# =========================================================
 
+class PostsResponse(BaseModel):
+    total: int
+    data: List[PostPublicoOut]
+
+
+# =========================================================
+# Convertir modelo de BD a respuesta pública
+# =========================================================
+
+def post_to_out(post_db: models.Post) -> PostPublicoOut:
+    """
+    Arma la respuesta pública a partir del registro
+    de la base de datos.
+    """
+
+    return PostPublicoOut(
+        id=post_db.id,
+        titulo=post_db.titulo,
+        contenido=post_db.contenido,
+        autor=AutorPublico(
+            nombre=post_db.autor_nombre
+        ),
+        estado=post_db.estado,
+        comentarios=COMENTARIOS_POR_POST.get(
+            post_db.id,
+            []
+        ),
+    )
+
+
+# =========================================================
+# GET /
+# =========================================================
+
+@app.get(
+    "/",
+    tags=TAG_SISTEMA,
+    summary="Mensaje de bienvenida"
+)
+def home():
+    return {
+        "mensaje": "Bienvenidos a mi blog Edison Suares"
+    }
+
+
+# =========================================================
+# GET /posts
+# Listar posts con búsqueda, orden y paginación
+# =========================================================
 
 @app.get(
     "/posts",
-    response_model=List[PostPublicoOut],
+    response_model=PostsResponse,
     summary="Listar posts del blog",
-    description="Devuelve los posts, con soporte de búsqueda, orden y paginación.",
-    response_description="Lista de posts que cumplen los filtros solicitados",
+    description=(
+        "Devuelve los posts, con soporte de búsqueda, "
+        "orden y paginación (leído desde la base de datos)."
+    ),
+    response_description=(
+        "Total de posts y datos filtrados, ordenados y paginados"
+    ),
     tags=TAG_POSTS,
 )
 def list_posts(
-    query: str | None = Query(default=None, min_length=2, max_length=50, description="Texto para buscar por título"),
-    skip: int = Query(default=0, ge=0, description="Cuántos posts saltar desde el inicio"),
-    limit: int = Query(default=10, ge=1, le=50, description="Cuántos posts devolver como máximo"),
-    order_by: Literal["id", "titulo"] = Query(default="id", description="Campo por el cual ordenar"),
-    order: Literal["asc", "desc"] = Query(default="asc", description="Dirección del orden"),
+    query: str | None = Query(
+        default=None,
+        min_length=2,
+        max_length=50,
+        description="Texto para buscar por título"
+    ),
+
+    skip: int = Query(
+        default=0,
+        ge=0,
+        description="Cuántos posts saltar desde el inicio"
+    ),
+
+    limit: int = Query(
+        default=10,
+        ge=1,
+        le=50,
+        description="Cuántos posts devolver como máximo"
+    ),
+
+    order_by: Literal["id", "titulo"] = Query(
+        default="id",
+        description="Campo por el cual ordenar"
+    ),
+
+    order: Literal["asc", "desc"] = Query(
+        default="asc",
+        description="Dirección del orden"
+    ),
+
+    db: Session = Depends(get_db),
 ):
-    resultados = BLOG_POST
+    # Consulta inicial
+    consulta = db.query(models.Post)
+
+    # -----------------------------------------
+    # Búsqueda por título
+    # -----------------------------------------
+
     if query:
-        resultados = [post for post in resultados if query.lower() in post["titulo"].lower()]
-    resultados = sorted(resultados, key=lambda post: post[order_by], reverse=(order == "desc"))
-    return resultados[skip: skip + limit]
+        consulta = consulta.filter(
+            models.Post.titulo.contains(query)
+        )
+
+    # -----------------------------------------
+    # Total ANTES de aplicar paginación
+    # -----------------------------------------
+
+    total = consulta.count()
+
+    # -----------------------------------------
+    # Orden
+    # -----------------------------------------
+
+    columna = getattr(
+        models.Post,
+        order_by
+    )
+
+    if order == "desc":
+        consulta = consulta.order_by(
+            columna.desc()
+        )
+    else:
+        consulta = consulta.order_by(
+            columna.asc()
+        )
+
+    # -----------------------------------------
+    # Paginación
+    # -----------------------------------------
+
+    posts = (
+        consulta
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+    # -----------------------------------------
+    # Respuesta
+    # -----------------------------------------
+
+    return {
+        "total": total,
+        "data": [
+            post_to_out(post)
+            for post in posts
+        ]
+    }
 
 
-@app.get("/posts/buscar", summary="Buscar varios posts por id", tags=TAG_POSTS)
-def buscar_posts_por_id(id: list[int] = Query(default=[], description="Puede repetirse: ?id=1&id=3")):
+# =========================================================
+# GET /posts/buscar
+# Buscar varios posts por ID
+# =========================================================
+
+@app.get(
+    "/posts/buscar",
+    summary="Buscar varios posts por id",
+    tags=TAG_POSTS
+)
+def buscar_posts_por_id(
+    id: list[int] = Query(
+        default=[],
+        description="Puede repetirse: ?id=1&id=3"
+    ),
+
+    db: Session = Depends(get_db),
+):
     if not id:
-        return {"datos": []}
-    return {"datos": [post for post in BLOG_POST if post["id"] in id]}
+        return {
+            "datos": []
+        }
 
+    posts = (
+        db.query(models.Post)
+        .filter(models.Post.id.in_(id))
+        .all()
+    )
+
+    return {
+        "datos": [
+            post_to_out(post)
+            for post in posts
+        ]
+    }
+
+
+# =========================================================
+# GET /posts/buscar-avanzado
+# =========================================================
 
 @app.get(
     "/posts/buscar-avanzado",
     summary="Búsqueda avanzada de posts",
-    description="Combina búsqueda por texto, filtro por ids, orden y paginación.",
-    response_description="Lista de posts que cumplen los filtros, ya ordenada y paginada",
+    description=(
+        "Combina búsqueda por texto, filtro por ids, "
+        "orden y paginación."
+    ),
+    response_description=(
+        "Lista de posts que cumplen los filtros, "
+        "ya ordenada y paginada"
+    ),
     tags=TAG_POSTS,
 )
 def buscar_avanzado(
-    query: str | None = Query(default=None, min_length=2, max_length=50, description="Texto para buscar por título"),
-    buscar: str | None = Query(default=None, deprecated=True, description="OBSOLETO: usa 'query'"),
-    ids: list[int] = Query(default=[], description="Lista de ids para filtrar (puede repetirse: ?ids=1&ids=2)"),
-    order_by: Literal["id", "titulo"] = Query(default="id", description="Campo por el cual ordenar"),
-    order: Literal["asc", "desc"] = Query(default="asc", description="Dirección del orden"),
-    skip: int = Query(default=0, ge=0, description="Cuántos posts saltar desde el inicio"),
-    limit: int = Query(default=10, ge=1, le=50, description="Cuántos posts devolver como máximo"),
+    query: str | None = Query(
+        default=None,
+        min_length=2,
+        max_length=50,
+        description="Texto para buscar en el título"
+    ),
+
+    buscar: str | None = Query(
+        default=None,
+        deprecated=True,
+        description="OBSOLETO: usa 'query'"
+    ),
+
+    ids: list[int] = Query(
+        default=[],
+        description=(
+            "Lista de ids para filtrar "
+            "(puede repetirse: ?ids=1&ids=2)"
+        )
+    ),
+
+    order_by: Literal["id", "titulo"] = Query(
+        default="id",
+        description="Campo por el cual ordenar"
+    ),
+
+    order: Literal["asc", "desc"] = Query(
+        default="asc",
+        description="Dirección del orden"
+    ),
+
+    skip: int = Query(
+        default=0,
+        ge=0,
+        description="Cuántos posts saltar desde el inicio"
+    ),
+
+    limit: int = Query(
+        default=10,
+        ge=1,
+        le=50,
+        description="Cuántos posts devolver como máximo"
+    ),
+
+    db: Session = Depends(get_db),
 ):
-    texto_busqueda = query if query is not None else buscar
-    resultados = BLOG_POST
+    texto_busqueda = (
+        query
+        if query is not None
+        else buscar
+    )
+
+    consulta = db.query(models.Post)
+
     if texto_busqueda:
-        resultados = [post for post in resultados if texto_busqueda.lower() in post["titulo"].lower()]
+        consulta = consulta.filter(
+            models.Post.titulo.contains(texto_busqueda)
+        )
+
     if ids:
-        resultados = [post for post in resultados if post["id"] in ids]
-    total_sin_paginar = len(resultados)
-    resultados = sorted(resultados, key=lambda post: post[order_by], reverse=(order == "desc"))
-    paginados = resultados[skip: skip + limit]
-    return {"datos": paginados, "total_sin_paginar": total_sin_paginar, "skip": skip, "limit": limit}
+        consulta = consulta.filter(
+            models.Post.id.in_(ids)
+        )
+
+    total_sin_paginar = consulta.count()
+
+    columna = getattr(
+        models.Post,
+        order_by
+    )
+
+    if order == "desc":
+        consulta = consulta.order_by(
+            columna.desc()
+        )
+    else:
+        consulta = consulta.order_by(
+            columna.asc()
+        )
+
+    posts = (
+        consulta
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "datos": [
+            post_to_out(post)
+            for post in posts
+        ],
+        "total_sin_paginar": total_sin_paginar,
+        "skip": skip,
+        "limit": limit,
+    }
 
 
-@app.get("/posts/destacado", tags=TAG_POSTS, summary="Post destacado")
-def post_destacado():
-    if not BLOG_POST:
-        return {"error": "No hay posts todavía"}
-    return {"destacado": BLOG_POST[0]}
+# =========================================================
+# GET /posts/destacado
+# =========================================================
+
+@app.get(
+    "/posts/destacado",
+    tags=TAG_POSTS,
+    summary="Post destacado"
+)
+def post_destacado(
+    db: Session = Depends(get_db)
+):
+    post = (
+        db.query(models.Post)
+        .order_by(models.Post.id.asc())
+        .first()
+    )
+
+    if not post:
+        return {
+            "error": "No hay posts todavía"
+        }
+
+    return {
+        "destacado": post_to_out(post)
+    }
 
 
-@app.get("/posts/vacios", tags=TAG_POSTS, summary="Verificar si hay posts")
-def posts_vacios():
-    if not BLOG_POST:
-        return {"total": 0}
-    return {"total": len(BLOG_POST)}
+# =========================================================
+# GET /posts/vacios
+# =========================================================
 
+@app.get(
+    "/posts/vacios",
+    tags=TAG_POSTS,
+    summary="Verificar si hay posts"
+)
+def posts_vacios(
+    db: Session = Depends(get_db)
+):
+    total = db.query(models.Post).count()
+
+    if total == 0:
+        return {
+            "total": 0
+        }
+
+    return {
+        "total": total
+    }
+
+
+# =========================================================
+# GET /posts/{post_id}
+# =========================================================
 
 @app.get(
     "/posts/{post_id}",
@@ -195,71 +527,274 @@ def posts_vacios():
     tags=TAG_POSTS,
 )
 def get_post(
-    post_id: int = Path(gt=0, description="ID del post a consultar"),
-    incluir_contenido: bool = Query(default=True, description="Incluir o no el contenido"),
-    include_content: bool | None = Query(default=None, deprecated=True, description="OBSOLETO: usa 'incluir_contenido' en su lugar"),
+    post_id: int = Path(
+        gt=0,
+        description="ID del post a consultar"
+    ),
+
+    incluir_contenido: bool = Query(
+        default=True,
+        description="Incluir o no el contenido"
+    ),
+
+    include_content: bool | None = Query(
+        default=None,
+        deprecated=True,
+        description=(
+            "OBSOLETO: usa 'incluir_contenido' en su lugar"
+        )
+    ),
+
+    db: Session = Depends(get_db),
 ):
-    valor_final = include_content if include_content is not None else incluir_contenido
-    for post in BLOG_POST:
-        if post["id"] == post_id:
-            if not valor_final:
-                return {"id": post["id"], "titulo": post["titulo"]}
-            return PostPublicoOut(**post)
-    raise HTTPException(status_code=404, detail="No se encontró el post")
+    valor_final = (
+        include_content
+        if include_content is not None
+        else incluir_contenido
+    )
+
+    post = (
+        db.query(models.Post)
+        .filter(models.Post.id == post_id)
+        .first()
+    )
+
+    if not post:
+        raise HTTPException(
+            status_code=404,
+            detail="No se encontró el post"
+        )
+
+    if not valor_final:
+        return {
+            "id": post.id,
+            "titulo": post.titulo
+        }
+
+    return post_to_out(post)
 
 
-@app.post("/posts", status_code=201, summary="Crear un post nuevo", response_description="El post recién creado", tags=TAG_POSTS)
-def create_post(post: PostCreate):
-    new_id = (BLOG_POST[-1]["id"] + 1) if BLOG_POST else 1
-    new_post = {
-        "id": new_id,
-        "titulo": post.titulo,
-        "contenido": post.contenido,
-        "autor": post.autor.model_dump(),
-        "estado": "borrador",
-        "comentarios": [],
+# =========================================================
+# POST /posts
+# =========================================================
+
+@app.post(
+    "/posts",
+    status_code=201,
+    response_model=PostPublicoOut,
+    summary="Crear un post nuevo",
+    response_description="El post recién creado",
+    tags=TAG_POSTS,
+)
+def create_post(
+    post: PostCreate,
+    db: Session = Depends(get_db)
+):
+    nuevo_post = models.Post(
+        titulo=post.titulo,
+        contenido=post.contenido,
+        autor_nombre=post.autor.nombre,
+        autor_email=post.autor.email,
+        estado="borrador",
+    )
+
+    db.add(nuevo_post)
+
+    db.commit()
+
+    db.refresh(nuevo_post)
+
+    return post_to_out(nuevo_post)
+
+
+# =========================================================
+# PUT /posts/{post_id}
+# =========================================================
+
+@app.put(
+    "/posts/{post_id}",
+    summary="Actualizar un post",
+    response_description="El post ya actualizado",
+    tags=TAG_POSTS,
+)
+def update_post(
+    post_id: int = Path(
+        gt=0,
+        description="ID del post a actualizar"
+    ),
+
+    data: PostUpdate = None,
+
+    db: Session = Depends(get_db),
+):
+    post = (
+        db.query(models.Post)
+        .filter(models.Post.id == post_id)
+        .first()
+    )
+
+    if not post:
+        raise HTTPException(
+            status_code=404,
+            detail="No se encontró el post"
+        )
+
+    payload = data.model_dump(
+        exclude_unset=True
+    )
+
+    for campo, valor in payload.items():
+        setattr(post, campo, valor)
+
+    db.commit()
+
+    db.refresh(post)
+
+    return {
+        "mensaje": "Post actualizado",
+        "data": post_to_out(post)
     }
-    BLOG_POST.append(new_post)
-    return {"mensaje": "Post creado con éxito", "data": new_post}
 
 
-@app.put("/posts/{post_id}", summary="Actualizar un post", response_description="El post ya actualizado", tags=TAG_POSTS)
-def update_post(post_id: int = Path(gt=0, description="ID del post a actualizar"), data: PostUpdate = None):
-    for post in BLOG_POST:
-        if post["id"] == post_id:
-            payload = data.model_dump(exclude_unset=True)
-            if "titulo" in payload:
-                post["titulo"] = payload["titulo"]
-            if "contenido" in payload:
-                post["contenido"] = payload["contenido"]
-            return {"mensaje": "Post actualizado", "data": post}
-    raise HTTPException(status_code=404, detail="No se encontró el post")
+# =========================================================
+# DELETE /posts/{post_id}
+# =========================================================
+
+@app.delete(
+    "/posts/{post_id}",
+    status_code=204,
+    summary="Eliminar un post",
+    tags=TAG_POSTS
+)
+def delete_post(
+    post_id: int = Path(
+        gt=0,
+        description="ID del post a eliminar"
+    ),
+
+    db: Session = Depends(get_db),
+):
+    post = (
+        db.query(models.Post)
+        .filter(models.Post.id == post_id)
+        .first()
+    )
+
+    if not post:
+        raise HTTPException(
+            status_code=404,
+            detail="Post no encontrado para eliminar"
+        )
+
+    db.delete(post)
+
+    db.commit()
+
+    COMENTARIOS_POR_POST.pop(
+        post_id,
+        None
+    )
+
+    return
 
 
-@app.delete("/posts/{post_id}", status_code=204, summary="Eliminar un post", tags=TAG_POSTS)
-def delete_post(post_id: int = Path(gt=0, description="ID del post a eliminar")):
-    for index, post in enumerate(BLOG_POST):
-        if post["id"] == post_id:
-            BLOG_POST.pop(index)
-            return
-    raise HTTPException(status_code=404, detail="Post no encontrado para eliminar")
+# =========================================================
+# POST /posts/{post_id}/comentarios
+# =========================================================
+
+@app.post(
+    "/posts/{post_id}/comentarios",
+    status_code=201,
+    summary="Agregar un comentario a un post",
+    response_description="El comentario recién agregado",
+    tags=TAG_POSTS,
+)
+def add_comentario(
+    post_id: int = Path(
+        gt=0,
+        description="ID del post a comentar"
+    ),
+
+    comentario: ComentarioCreate = None,
+
+    db: Session = Depends(get_db),
+):
+    post = (
+        db.query(models.Post)
+        .filter(models.Post.id == post_id)
+        .first()
+    )
+
+    if not post:
+        raise HTTPException(
+            status_code=404,
+            detail="No se encontró el post"
+        )
+
+    lista_actual = COMENTARIOS_POR_POST.setdefault(
+        post_id,
+        []
+    )
+
+    nuevo_id = (
+        lista_actual[-1]["id"] + 1
+        if lista_actual
+        else 1
+    )
+
+    nuevo_comentario = {
+        "id": nuevo_id,
+        "contenido": comentario.contenido,
+        "autor": comentario.autor
+    }
+
+    lista_actual.append(
+        nuevo_comentario
+    )
+
+    return {
+        "mensaje": "Comentario agregado",
+        "data": nuevo_comentario
+    }
 
 
-@app.post("/posts/{post_id}/comentarios", status_code=201, summary="Agregar un comentario a un post", response_description="El comentario recién agregado", tags=TAG_POSTS)
-def add_comentario(post_id: int = Path(gt=0, description="ID del post a comentar"), comentario: ComentarioCreate = None):
-    for post in BLOG_POST:
-        if post["id"] == post_id:
-            new_comment_id = (post["comentarios"][-1]["id"] + 1) if post["comentarios"] else 1
-            nuevo_comentario = {"id": new_comment_id, "contenido": comentario.contenido, "autor": comentario.autor}
-            post["comentarios"].append(nuevo_comentario)
-            return {"mensaje": "Comentario agregado", "data": nuevo_comentario}
-    raise HTTPException(status_code=404, detail="No se encontró el post")
+# =========================================================
+# PATCH /posts/{post_id}/publicar
+# =========================================================
 
+@app.patch(
+    "/posts/{post_id}/publicar",
+    summary="Publicar un post",
+    response_description="El post ya publicado",
+    tags=TAG_POSTS
+)
+def publicar_post(
+    post_id: int = Path(
+        gt=0,
+        description="ID del post a publicar"
+    ),
 
-@app.patch("/posts/{post_id}/publicar", summary="Publicar un post", response_description="El post ya publicado", tags=TAG_POSTS)
-def publicar_post(post_id: int = Path(gt=0, description="ID del post a publicar")):
-    for post in BLOG_POST:
-        if post["id"] == post_id:
-            post["estado"] = "publicado"
-            return {"mensaje": "Post publicado", "data": post}
-    raise HTTPException(status_code=404, detail="No se encontró el post")
+    db: Session = Depends(get_db),
+):
+    post = (
+        db.query(models.Post)
+        .filter(models.Post.id == post_id)
+        .first()
+    )
+
+    if not post:
+        raise HTTPException(
+            status_code=404,
+            detail="No se encontró el post"
+        )
+
+    post.estado = "publicado"
+
+    db.commit()
+
+    db.refresh(post)
+
+    return {
+        "mensaje": "Post publicado",
+        "data": post_to_out(post)
+    }
